@@ -1,4 +1,4 @@
-# GRPO + DistiLLM-v2 Trainer
+# GRPO + DistiLLM-v2 Trainer (Token-Level Implementation)
 # Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +15,19 @@
 """
 GRPO (Group Relative Policy Optimization) combined with DistiLLM-v2 distillation loss.
 
-Key differences from standard GRPO:
-- KL regularization term is replaced with DistiLLM-v2's adaptive mixture KL divergence
-- Teacher model is used for distillation (NOT as the baseline for GRPO)
-- π_θ_old (old policy) is the student model from the previous timestep
-- Each prompt samples G=4 responses for group-based advantage estimation
+Token-Level Implementation following the original GRPO formula:
+
+J_GRPO(θ) = E[q~P(Q), {o_i}~π_θ_old(O|q)] * (1/G) * Σ_i (1/|o_i|) * Σ_t [
+    min(
+        r_{i,t} * A_hat_i,
+        clip(r_{i,t}, 1-ε, 1+ε) * A_hat_i
+    )
+] - β * DistiLLM_v2_loss(π_θ || π_teacher)
+
+where:
+- r_{i,t} = π_θ(o_{i,t}|q,o_{i,<t}) / π_θ_old(o_{i,t}|q,o_{i,<t})  [PER-TOKEN ratio]
+- A_hat_i is the group-normalized advantage for response i
+- The clipping and min operation happen at EACH TOKEN position
 """
 import math
 import inspect
@@ -75,6 +83,7 @@ class GRPODataCollatorWithPadding:
     """
     Data collator for GRPO that handles prompt-only data.
     Different from DPO - we only need prompts, responses are generated online.
+    Now also handles solutions for math reward computation.
     """
     def __init__(
         self,
@@ -92,6 +101,7 @@ class GRPODataCollatorWithPadding:
             "prompt_input_ids": [],
             "prompt_attention_mask": [],
             "prompt": [],
+            "solution": [],  # ADD: solutions for reward computation
         }
         
         for feature in features:
@@ -106,6 +116,7 @@ class GRPODataCollatorWithPadding:
             batch["prompt_input_ids"].append(prompt_ids)
             batch["prompt_attention_mask"].append(prompt_mask)
             batch["prompt"].append(feature.get("prompt", ""))
+            batch["solution"].append(feature.get("solution", ""))  # ADD
         
         batch["prompt_input_ids"] = torch.tensor(batch["prompt_input_ids"], dtype=torch.long)
         batch["prompt_attention_mask"] = torch.tensor(batch["prompt_attention_mask"], dtype=torch.long)
@@ -115,32 +126,29 @@ class GRPODataCollatorWithPadding:
 
 class GRPODistiLLMTrainer(Trainer):
     """
-    GRPO Trainer with DistiLLM-v2 distillation loss.
+    GRPO Trainer with DistiLLM-v2 distillation loss (Token-Level Implementation).
+    
+    This implementation follows the original GRPO formula where the PPO clipping
+    is applied at each token position, not at the sequence level.
     
     Loss function:
-    J_GRPO(θ) = E[q~P(Q), {o_i}~π_θ_old(O|q)] * (1/G) * Σ (1/|o_i|) * Σ_t [
+    J_GRPO(θ) = E[q~P(Q), {o_i}~π_θ_old(O|q)] * (1/G) * Σ_i (1/|o_i|) * Σ_t [
         min(
-            r_t * A_hat_i,t,
-            clip(r_t, 1-ε, 1+ε) * A_hat_i,t
+            r_{i,t} * A_hat_i,
+            clip(r_{i,t}, 1-ε, 1+ε) * A_hat_i
         )
     ] - β * DistiLLM_v2_loss(π_θ || π_teacher)
     
     where:
-    - r_t = π_θ(o_i,t|q,o_i,<t) / π_θ_old(o_i,t|q,o_i,<t)
-    - A_hat_i,t is the advantage (normalized reward within the group)
+    - r_{i,t} = π_θ(o_{i,t}|q,o_{i,<t}) / π_θ_old(o_{i,t}|q,o_{i,<t})  [PER-TOKEN]
+    - A_hat_i is the advantage (normalized reward within the group) [PER-SEQUENCE]
     - π_θ_old is the OLD student policy (NOT the teacher)
     - π_teacher is the teacher model for distillation
     - G is the number of samples per prompt (default=4)
     
-    Args:
-        model: The student model to train
-        teacher_model: The teacher model for distillation (frozen)
-        args: Training arguments (GRPOConfig)
-        num_samples_per_prompt: Number of responses to sample per prompt (G)
-        clip_epsilon: PPO clipping parameter (ε)
-        beta: Weight for DistiLLM-v2 loss
-        reward_model: Optional reward model for computing rewards
-        tokenizer: Tokenizer for encoding/decoding
+    Math Reward Support:
+    - Dataset should have 'prompt' and 'solution' columns
+    - Reward functions receive solutions for accuracy computation
     """
 
     _tag_names = ["trl", "grpo", "distillm"]
@@ -179,9 +187,12 @@ class GRPODistiLLMTrainer(Trainer):
         # Reward (can be rule-based or model-based)
         reward_funcs: Optional[List[Callable]] = None,
         reward_weights: Optional[List[float]] = None,
+        reward_kwargs: Optional[Dict[str, Any]] = None,  # ADD: extra kwargs for reward functions
         # Other
         disable_dropout: bool = True,
         label_pad_token_id: int = -100,
+        # Dataset columns
+        solution_column: str = "solution",  # ADD: column name for solutions
     ):
         # Handle model initialization
         if model_init_kwargs is None:
@@ -270,6 +281,10 @@ class GRPODistiLLMTrainer(Trainer):
         # Reward functions (can be multiple)
         self.reward_funcs = reward_funcs if reward_funcs is not None else []
         self.reward_weights = reward_weights if reward_weights is not None else [1.0] * len(self.reward_funcs)
+        self.reward_kwargs = reward_kwargs if reward_kwargs is not None else {}  # ADD
+        
+        # Dataset column names
+        self.solution_column = solution_column  # ADD
         
         # Data collator
         if data_collator is None:
@@ -290,7 +305,7 @@ class GRPODistiLLMTrainer(Trainer):
         # Metrics storage
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         
-        # Tokenize dataset (only prompts needed for GRPO)
+        # Tokenize dataset (only prompts needed for GRPO, but keep solutions)
         with PartialState().local_main_process_first():
             train_dataset = train_dataset.map(
                 self.tokenize_prompt, 
@@ -362,7 +377,7 @@ class GRPODistiLLMTrainer(Trainer):
         return model
 
     def tokenize_prompt(self, example: Dict) -> Dict:
-        """Tokenize a single prompt."""
+        """Tokenize a single prompt and preserve solution."""
         prompt = example["prompt"]
         
         # Handle different prompt formats
@@ -379,11 +394,17 @@ class GRPODistiLLMTrainer(Trainer):
             add_special_tokens=True,
         )
         
-        return {
+        result = {
             "prompt_input_ids": tokens["input_ids"],
             "prompt_attention_mask": tokens["attention_mask"],
             "prompt": prompt_text,
         }
+        
+        # ADD: Preserve solution if present
+        if self.solution_column in example:
+            result["solution"] = example[self.solution_column]
+        
+        return result
 
     @torch.no_grad()
     def generate_responses(
@@ -442,6 +463,7 @@ class GRPODistiLLMTrainer(Trainer):
         responses: List[str],
         prompt_ids: torch.Tensor,
         response_ids: torch.Tensor,
+        solutions: List[str] = None,  # ADD: solutions parameter
     ) -> torch.Tensor:
         """
         Compute rewards for generated responses.
@@ -452,6 +474,7 @@ class GRPODistiLLMTrainer(Trainer):
             responses: List of response strings
             prompt_ids: Prompt token ids
             response_ids: Full sequence (prompt + response) token ids
+            solutions: List of ground truth solutions (for math tasks)
             
         Returns:
             rewards: [batch_size * num_samples] tensor of rewards
@@ -471,7 +494,15 @@ class GRPODistiLLMTrainer(Trainer):
             # Combine multiple reward functions
             all_rewards = []
             for reward_func, weight in zip(self.reward_funcs, self.reward_weights):
-                r = reward_func(prompts, responses, prompt_ids, response_ids)
+                # UPDATED: Pass solutions and extra kwargs to reward function
+                r = reward_func(
+                    prompts, 
+                    responses, 
+                    prompt_ids, 
+                    response_ids,
+                    solutions=solutions,  # ADD
+                    **self.reward_kwargs  # ADD
+                )
                 if not isinstance(r, torch.Tensor):
                     r = torch.tensor(r, device=device, dtype=torch.float32)
                 all_rewards.append(weight * r)
@@ -493,7 +524,7 @@ class GRPODistiLLMTrainer(Trainer):
             num_samples: G (number of samples per prompt)
             
         Returns:
-            advantages: [batch_size * num_samples] normalized advantages
+            advantages: [batch_size * num_samples] normalized advantages (per-sequence)
         """
         # Reshape to [batch_size, num_samples]
         batch_size = rewards.shape[0] // num_samples
@@ -515,7 +546,7 @@ class GRPODistiLLMTrainer(Trainer):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute per-token log probabilities.
         
@@ -526,7 +557,8 @@ class GRPODistiLLMTrainer(Trainer):
             labels: [batch_size, seq_len] with -100 for tokens to ignore
             
         Returns:
-            per_token_logps: [batch_size, seq_len-1]
+            per_token_logps: [batch_size, seq_len-1] log probs for each token
+            mask: [batch_size, seq_len-1] mask for valid tokens
         """
         outputs = model(
             input_ids=input_ids,
@@ -543,17 +575,114 @@ class GRPODistiLLMTrainer(Trainer):
         log_probs = F.log_softmax(logits, dim=-1)
         
         # Gather log probs for actual tokens
+        # Handle -100 labels by replacing with 0 temporarily
+        gather_labels = labels.clone()
+        gather_labels[labels == self.label_pad_token_id] = 0
+        
         per_token_logps = torch.gather(
             log_probs, 
             dim=-1, 
-            index=labels.unsqueeze(-1)
+            index=gather_labels.unsqueeze(-1)
         ).squeeze(-1)
         
-        # Mask out padding
+        # Create mask for valid response tokens (not prompt, not padding)
         mask = (labels != self.label_pad_token_id).float()
+        
+        # Zero out log probs for masked positions
         per_token_logps = per_token_logps * mask
         
         return per_token_logps, mask
+
+    def compute_token_level_ppo_loss(
+        self,
+        current_logps: torch.Tensor,
+        old_logps: torch.Tensor,
+        advantages: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute token-level PPO loss following the original GRPO formula.
+        
+        Formula:
+        L = -(1/G) * Σ_i (1/|o_i|) * Σ_t min(r_{i,t} * A_i, clip(r_{i,t}) * A_i)
+        
+        where r_{i,t} = π_θ(o_{i,t}|q,o_{i,<t}) / π_θ_old(o_{i,t}|q,o_{i,<t})
+        
+        Args:
+            current_logps: [batch_size, seq_len] current policy log probs per token
+            old_logps: [batch_size, seq_len] old policy log probs per token
+            advantages: [batch_size] per-sequence advantages (will be broadcast)
+            mask: [batch_size, seq_len] mask for valid tokens
+            
+        Returns:
+            ppo_loss: Scalar loss
+            metrics: Dictionary with per-token statistics
+        """
+        # Compute per-token log ratio: log(π_θ / π_θ_old) = log π_θ - log π_θ_old
+        # Shape: [batch_size, seq_len]
+        log_ratio = current_logps - old_logps
+        
+        # Compute per-token ratio: r_{i,t} = exp(log_ratio)
+        # Shape: [batch_size, seq_len]
+        ratio = torch.exp(log_ratio)
+        
+        # Clip the ratio
+        # Shape: [batch_size, seq_len]
+        clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon)
+        
+        # Expand advantages to match token dimension
+        # advantages: [batch_size] -> [batch_size, 1] for broadcasting
+        # The same advantage A_i applies to all tokens in sequence i
+        advantages_expanded = advantages.unsqueeze(-1)  # [batch_size, 1]
+        
+        # Compute per-token objectives
+        # obj1 = r_{i,t} * A_i
+        # obj2 = clip(r_{i,t}) * A_i
+        # Shape: [batch_size, seq_len]
+        obj1 = ratio * advantages_expanded
+        obj2 = clipped_ratio * advantages_expanded
+        
+        # Take minimum (pessimistic bound) at each token position
+        # Shape: [batch_size, seq_len]
+        per_token_objective = torch.min(obj1, obj2)
+        
+        # Apply mask to only count response tokens
+        # Shape: [batch_size, seq_len]
+        masked_objective = per_token_objective * mask
+        
+        # Compute (1/|o_i|) * Σ_t for each sequence
+        # Sum over tokens and divide by number of valid tokens per sequence
+        # Shape: [batch_size]
+        seq_lengths = mask.sum(dim=1) + 1e-8  # Avoid division by zero
+        per_seq_objective = masked_objective.sum(dim=1) / seq_lengths
+        
+        # Average over all sequences (1/G factor is implicit in mean)
+        # This gives us the final PPO objective
+        ppo_objective = per_seq_objective.mean()
+        
+        # Loss is negative of objective (we want to maximize the objective)
+        ppo_loss = -ppo_objective
+        
+        # Compute metrics for logging
+        with torch.no_grad():
+            # Mean ratio across all valid tokens
+            valid_ratios = ratio * mask
+            mean_ratio = valid_ratios.sum() / (mask.sum() + 1e-8)
+            
+            # Fraction of tokens where clipping occurred
+            clipped_mask = ((ratio - 1.0).abs() > self.clip_epsilon).float() * mask
+            clip_fraction = clipped_mask.sum() / (mask.sum() + 1e-8)
+            
+            # KL divergence approximation: E[log(π_θ/π_θ_old)]
+            approx_kl = (log_ratio * mask).sum() / (mask.sum() + 1e-8)
+        
+        metrics = {
+            "mean_ratio": mean_ratio,
+            "clip_fraction": clip_fraction,
+            "approx_kl": approx_kl,
+        }
+        
+        return ppo_loss, metrics
 
     def compute_distillm_v2_loss(
         self,
@@ -585,8 +714,12 @@ class GRPODistiLLMTrainer(Trainer):
         teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
         
         # Get per-token log probs for labels
-        student_token_logps = torch.gather(student_log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        teacher_token_logps = torch.gather(teacher_log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        # Handle -100 labels
+        gather_labels = labels.clone()
+        gather_labels[labels == self.label_pad_token_id] = 0
+        
+        student_token_logps = torch.gather(student_log_probs, dim=-1, index=gather_labels.unsqueeze(-1)).squeeze(-1)
+        teacher_token_logps = torch.gather(teacher_log_probs, dim=-1, index=gather_labels.unsqueeze(-1)).squeeze(-1)
         
         # Adaptive alpha_1 for forward KL (teacher -> mixture)
         alpha_1 = self.base_alpha_1
@@ -663,21 +796,23 @@ class GRPODistiLLMTrainer(Trainer):
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute the full GRPO + DistiLLM-v2 loss.
+        Compute the full GRPO + DistiLLM-v2 loss with TOKEN-LEVEL PPO.
         
         Steps:
         1. Generate G responses per prompt using current policy
-        2. Compute rewards and group-relative advantages
-        3. Compute policy ratio π_θ / π_θ_old
-        4. Compute clipped PPO objective
-        5. Compute DistiLLM-v2 distillation loss
-        6. Combine losses
+        2. Compute rewards and group-relative advantages (per-sequence)
+        3. Compute per-token policy ratios π_θ(o_t) / π_θ_old(o_t)
+        4. Compute clipped PPO objective at each token position
+        5. Average over tokens (1/|o_i|) then over sequences (1/G)
+        6. Compute DistiLLM-v2 distillation loss
+        7. Combine losses
         """
         metrics = {}
         
         prompt_input_ids = batch["prompt_input_ids"]
         prompt_attention_mask = batch["prompt_attention_mask"]
         prompts = batch["prompt"]
+        solutions = batch.get("solution", None)  # ADD: Get solutions from batch
         
         batch_size = prompt_input_ids.shape[0]
         num_samples = self.num_samples_per_prompt
@@ -703,21 +838,29 @@ class GRPODistiLLMTrainer(Trainer):
         for p in prompts:
             expanded_prompts.extend([p] * num_samples)
         
-        # Step 2: Compute rewards and advantages
+        # ADD: Expand solutions for reward computation
+        expanded_solutions = None
+        if solutions is not None:
+            expanded_solutions = []
+            for s in solutions:
+                expanded_solutions.extend([s] * num_samples)
+        
+        # Step 2: Compute rewards and advantages (per-sequence)
         rewards = self.compute_rewards(
             expanded_prompts, 
             responses,
             prompt_input_ids.repeat_interleave(num_samples, dim=0),
-            response_ids
+            response_ids,
+            solutions=expanded_solutions,  # ADD: Pass solutions
         )
-        advantages = self.compute_advantages(rewards, num_samples)
+        advantages = self.compute_advantages(rewards, num_samples)  # [batch_size * num_samples]
         
-        # Create labels (mask prompt tokens)
+        # Create labels (mask prompt tokens with -100)
         labels = response_ids.clone()
         for i, prompt_len in enumerate(prompt_lengths):
             labels[i, :prompt_len] = self.label_pad_token_id
         
-        # Step 3: Compute log probs for current policy
+        # Step 3: Compute per-token log probs for current policy
         current_logps, mask = self.get_per_token_logps(
             self.model, 
             response_ids, 
@@ -725,7 +868,7 @@ class GRPODistiLLMTrainer(Trainer):
             labels
         )
         
-        # Compute log probs for old policy (π_θ_old)
+        # Compute per-token log probs for old policy (π_θ_old)
         with torch.no_grad():
             old_logps, _ = self.get_per_token_logps(
                 self.old_policy_model,
@@ -734,26 +877,15 @@ class GRPODistiLLMTrainer(Trainer):
                 labels
             )
         
-        # Step 4: Compute policy ratio and clipped objective
-        # Sum log probs per sequence (or average)
-        current_seq_logps = (current_logps * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-        old_seq_logps = (old_logps * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        # Step 4 & 5: Compute token-level PPO loss
+        ppo_loss, ppo_metrics = self.compute_token_level_ppo_loss(
+            current_logps=current_logps,
+            old_logps=old_logps,
+            advantages=advantages,
+            mask=mask,
+        )
         
-        # Ratio: exp(log π_θ - log π_θ_old) = π_θ / π_θ_old
-        log_ratio = current_seq_logps - old_seq_logps
-        ratio = torch.exp(log_ratio)
-        
-        # Clipped ratio
-        clipped_ratio = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-        
-        # PPO objective (maximize, so negate for loss)
-        # obj = min(ratio * A, clip(ratio) * A)
-        obj1 = ratio * advantages
-        obj2 = clipped_ratio * advantages
-        ppo_objective = torch.min(obj1, obj2)
-        ppo_loss = -ppo_objective.mean()
-        
-        # Step 5: Compute DistiLLM-v2 loss
+        # Step 6: Compute DistiLLM-v2 loss
         # Get logits from current model and teacher
         student_outputs = self.model(
             input_ids=response_ids,
@@ -774,7 +906,7 @@ class GRPODistiLLMTrainer(Trainer):
             student_logits, teacher_logits, labels, mask
         )
         
-        # Step 6: Combine losses
+        # Step 7: Combine losses
         # J_GRPO = PPO_obj - β * DistiLLM_loss
         # As loss: L = -PPO_obj + β * DistiLLM_loss = ppo_loss + β * distillm_loss
         total_loss = ppo_loss + self.beta * distillm_loss
@@ -785,8 +917,16 @@ class GRPODistiLLMTrainer(Trainer):
         metrics["grpo/total_loss"] = total_loss.detach().cpu().item()
         metrics["grpo/mean_reward"] = rewards.mean().cpu().item()
         metrics["grpo/mean_advantage"] = advantages.mean().cpu().item()
-        metrics["grpo/mean_ratio"] = ratio.mean().cpu().item()
-        metrics["grpo/clip_fraction"] = ((ratio - 1).abs() > self.clip_epsilon).float().mean().cpu().item()
+        metrics["grpo/mean_ratio"] = ppo_metrics["mean_ratio"].cpu().item()
+        metrics["grpo/clip_fraction"] = ppo_metrics["clip_fraction"].cpu().item()
+        metrics["grpo/approx_kl"] = ppo_metrics["approx_kl"].cpu().item()
+        
+        # ADD: Log accuracy if using math rewards
+        if expanded_solutions is not None:
+            with torch.no_grad():
+                # Count correct answers
+                correct = (rewards > 0.5).float().mean().item()
+                metrics["grpo/accuracy"] = correct
         
         return total_loss, metrics
 
