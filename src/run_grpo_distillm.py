@@ -14,21 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-GRPO + DistiLLM-v2 Training Script
+GRPO + DistiLLM-v2 Training Script for Math Tasks
 
 This script trains a student model using:
 1. GRPO (Group Relative Policy Optimization) for RL-based training
 2. DistiLLM-v2 for knowledge distillation from a teacher model
+3. Math reward functions from math_rewards.py
 
 Key features:
 - Samples G responses per prompt for group-relative advantages
 - Uses adaptive mixture KL divergence for distillation
-- Teacher model guides the student, NOT used as GRPO baseline
-- π_θ_old (old policy) is the student from previous timestep
+- Supports math datasets with solution verification
 """
 
 import logging
 import random
+import re
 import sys
 import os
 from typing import List, Dict, Any
@@ -50,69 +51,56 @@ from alignment import (
     get_tokenizer,
     is_adapter_model,
 )
-from alignment.configs import GRPOConfig
+from alignment.grpo_configs import GRPOConfig
 from peft import PeftConfig, PeftModel
 from grpo_distillm_trainer import GRPODistiLLMTrainer
+
+# =============================================================================
+# IMPORT REWARD FUNCTIONS FROM math_rewards.py
+# =============================================================================
+from math_reward import accuracy_reward
+
 
 logger = logging.getLogger(__name__)
 
 
-def length_reward(
-    prompts: List[str],
-    responses: List[str],
-    prompt_ids: torch.Tensor,
-    response_ids: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Simple length-based reward function (example).
-    Rewards responses that are not too short or too long.
-    
-    Replace this with your actual reward function!
-    """
-    rewards = []
-    for response in responses:
-        words = len(response.split())
-        # Reward peaks around 50-100 words
-        if words < 10:
-            r = 0.1
-        elif words < 50:
-            r = 0.5 + 0.5 * (words / 50)
-        elif words <= 150:
-            r = 1.0
-        else:
-            r = max(0.5, 1.0 - (words - 150) / 200)
-        rewards.append(r)
-    return torch.tensor(rewards, dtype=torch.float32, device=response_ids.device)
+# =============================================================================
+# Solution Extraction for MetaMathQA
+# =============================================================================
 
-
-def format_reward(
-    prompts: List[str],
-    responses: List[str],
-    prompt_ids: torch.Tensor,
-    response_ids: torch.Tensor,
-) -> torch.Tensor:
+def extract_solution_from_response(response: str) -> str:
     """
-    Reward for good formatting (example).
-    Rewards responses with proper structure.
+    Extract the final answer from MetaMathQA response format.
     
-    Replace this with your actual reward function!
+    MetaMathQA responses typically end with:
+    - "The answer is X"
+    - "#### X" 
+    - "\\boxed{X}"
     """
-    rewards = []
-    for response in responses:
-        r = 0.5  # Base reward
-        
-        # Reward for having sentences
-        if '.' in response or '!' in response or '?' in response:
-            r += 0.2
-        
-        # Reward for not having repetition
-        words = response.lower().split()
-        if len(words) > 0:
-            unique_ratio = len(set(words)) / len(words)
-            r += 0.3 * unique_ratio
-        
-        rewards.append(r)
-    return torch.tensor(rewards, dtype=torch.float32, device=response_ids.device)
+    if not response:
+        return ""
+    
+    # Try "The answer is X" pattern
+    match = re.search(r'[Tt]he answer is[:\s]*([^\.\n]+)', response)
+    if match:
+        return match.group(1).strip()
+    
+    # Try "#### X" pattern (GSM8K style)
+    match = re.search(r'####\s*(.+?)(?:\n|$)', response)
+    if match:
+        return match.group(1).strip()
+    
+    # Try \boxed{X} pattern (MATH style)
+    match = re.search(r'\\boxed\{([^}]+)\}', response)
+    if match:
+        return match.group(1).strip()
+    
+    # Fallback: try to find last number
+    numbers = re.findall(r'-?\d+\.?\d*', response)
+    if numbers:
+        return numbers[-1]
+    
+    return response.strip()
 
 
 def main():
@@ -133,7 +121,6 @@ def main():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process the small summary:
     logger.info(f"Model parameters {model_args}")
     logger.info(f"Data parameters {data_args}")
     logger.info(f"Training/evaluation parameters {training_args}")
@@ -153,67 +140,107 @@ def main():
         data_args,
         splits=data_args.dataset_splits,
         configs=data_args.dataset_configs,
-        columns_to_keep=["messages", "prompt", "chosen", "rejected", "completion", "label"],
+        columns_to_keep=["query", "original_question", "response", "answer", "solution"],
     )
     logger.info(
         f"Training on the following splits: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
     )
     column_names = list(raw_datasets["train"].features)
+    logger.info(f"Dataset columns: {column_names}")
 
     #####################################
     # Load tokenizer
     #####################################
-    data_args.truncation_side = "left"  # Truncate from left to ensure we don't lose important context
+    data_args.truncation_side = "left"
     tokenizer = get_tokenizer(model_args, data_args)
 
     #####################
-    # Prepare prompts
+    # Prepare prompts and solutions
     #####################
-    def extract_prompt(example):
-        """Extract prompt from various dataset formats."""
+    def extract_prompt_and_solution(example):
+        """
+        Extract prompt and solution from various dataset formats.
+        
+        Supports:
+        - MetaMathQA: query, response
+        - GSM8K: question, answer
+        - Pre-processed: prompt, solution
+        """
+        result = {}
+        
+        # === Extract Prompt ===
         if "prompt" in example and example["prompt"]:
-            # Direct prompt field
             if isinstance(example["prompt"], list):
-                # Chat format - use as is
-                return {"prompt": example["prompt"]}
+                result["prompt"] = example["prompt"]
             else:
-                return {"prompt": example["prompt"]}
+                result["prompt"] = [{"role": "user", "content": example["prompt"]}]
+        
         elif "messages" in example and example["messages"]:
-            # Extract prompt from messages (all but last if it's assistant)
             messages = example["messages"]
             if messages[-1]["role"] == "assistant":
-                prompt = messages[:-1]
+                result["prompt"] = messages[:-1]
             else:
-                prompt = messages
-            return {"prompt": prompt}
+                result["prompt"] = messages
+        
+        elif "query" in example and example["query"]:
+            # MetaMathQA format
+            result["prompt"] = [{"role": "user", "content": example["query"]}]
+        
+        elif "question" in example and example["question"]:
+            # GSM8K format
+            result["prompt"] = [{"role": "user", "content": example["question"]}]
+        
         elif "chosen" in example:
-            # DPO format - use the prompt part from chosen
             if isinstance(example["chosen"], list):
-                # Chat format
                 messages = example["chosen"]
-                # Find the last user message as prompt
                 prompt = []
                 for msg in messages:
                     if msg["role"] != "assistant":
                         prompt.append(msg)
                     else:
                         break
-                return {"prompt": prompt}
+                result["prompt"] = prompt
             else:
-                # Text format - this is tricky, might need custom handling
-                return {"prompt": example.get("text_prompt", example["chosen"].split("\n")[0])}
+                result["prompt"] = [{"role": "user", "content": example["chosen"].split("\n")[0]}]
         else:
             raise ValueError(f"Cannot extract prompt from example: {example.keys()}")
+        
+        # === Extract Solution ===
+        if "solution" in example and example["solution"]:
+            # Already has solution column
+            result["solution"] = str(example["solution"])
+        
+        elif "response" in example and example["response"]:
+            # MetaMathQA: extract answer from response
+            result["solution"] = extract_solution_from_response(example["response"])
+        
+        elif "answer" in example and example["answer"]:
+            # GSM8K format: "... #### X"
+            answer = example["answer"]
+            if "####" in answer:
+                result["solution"] = answer.split("####")[1].strip()
+            else:
+                result["solution"] = extract_solution_from_response(answer)
+        
+        else:
+            # No solution available
+            result["solution"] = ""
+        
+        return result
 
     raw_datasets = raw_datasets.map(
-        extract_prompt,
+        extract_prompt_and_solution,
         num_proc=data_args.preprocessing_num_workers,
-        desc="Extracting prompts",
+        desc="Extracting prompts and solutions",
     )
 
-    # Log a few random samples from the training set:
+    # Log a few random samples
+    logger.info("Sample examples after processing:")
     for index in random.sample(range(len(raw_datasets["train"])), min(3, len(raw_datasets["train"]))):
-        logger.info(f"Prompt sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['prompt']}")
+        example = raw_datasets["train"][index]
+        logger.info(f"  Example {index}:")
+        logger.info(f"    Prompt: {example['prompt']}")
+        logger.info(f"    Solution: {example.get('solution', 'N/A')}")
 
     #######################
     # Load models
@@ -226,12 +253,15 @@ def main():
     model_kwargs = dict(
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
-        attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
     )
+    
+    # Add attention implementation if specified
+    if model_args.attn_implementation:
+        model_kwargs["attn_implementation"] = model_args.attn_implementation
 
     # Load student model
     logger.info(f"Loading student model from {model_args.model_name_or_path}")
@@ -255,6 +285,7 @@ def main():
         )
 
     # Load teacher model
+    teacher_model = None
     if model_args.ref_model_name_or_path is not None:
         logger.info(f"Loading teacher model from {model_args.ref_model_name_or_path}")
         teacher_model = AutoModelForCausalLM.from_pretrained(
@@ -262,20 +293,27 @@ def main():
             **model_kwargs,
         )
     else:
-        logger.warning("No teacher model specified! Using student model as teacher (not recommended).")
-        teacher_model = None
+        logger.warning("No teacher model specified! Distillation will be disabled (beta=0).")
 
     #########################
     # Setup reward functions
     #########################
-    # You can customize these reward functions based on your task
-    reward_funcs = [
-        length_reward,
-        format_reward,
-    ]
-    reward_weights = [0.5, 0.5]  # Equal weights
+    # Kiểm tra xem dataset có solution không
+    has_solutions = "solution" in raw_datasets["train"].column_names and \
+                   raw_datasets["train"][0].get("solution", "") != ""
     
-    logger.info(f"Using {len(reward_funcs)} reward functions with weights {reward_weights}")
+    if has_solutions:
+        logger.info("Dataset has solutions - using accuracy-based rewards from math_rewards.py")
+        
+        # Sử dụng reward functions từ math_rewards.py
+        reward_funcs = [
+            accuracy_reward,      # Main: đánh giá đúng/sai
+        ]
+        reward_kwargs = {}  # accuracy_reward sẽ nhận solutions từ trainer
+    
+    logger.info(f"Using {len(reward_funcs)} reward functions:")
+    for func in reward_funcs:
+        logger.info(f"  - {func.__name__}")
 
     #########################
     # Instantiate GRPO trainer
@@ -288,28 +326,38 @@ def main():
         eval_dataset=raw_datasets.get("test"),
         tokenizer=tokenizer,
         peft_config=get_peft_config(model_args),
+        
         # GRPO specific
         num_samples_per_prompt=training_args.num_samples_per_prompt,
         clip_epsilon=training_args.clip_epsilon,
-        beta=training_args.beta,
+        beta=training_args.beta if teacher_model else 0.0,  # Disable distillation if no teacher
+        
         # DistiLLM specific
         base_alpha_1=training_args.base_alpha_1,
         base_alpha_2=training_args.base_alpha_2,
+        
         # Generation
         max_length=training_args.max_length,
         max_prompt_length=training_args.max_prompt_length,
         max_new_tokens=training_args.max_new_tokens,
         temperature=training_args.temperature,
         top_p=training_args.top_p,
-        # Reward
+        
+        # Reward - SỬ DỤNG REWARD TỪ math_rewards.py
         reward_funcs=reward_funcs,
-        reward_weights=reward_weights,
+        reward_kwargs=reward_kwargs,
+        
+        # Dataset column for solutions
+        solution_column="solution",
     )
 
     ###############
     # Training loop
     ###############
     logger.info("*** Starting GRPO + DistiLLM-v2 Training ***")
+    logger.info(f"  Num samples per prompt (G): {training_args.num_samples_per_prompt}")
+    logger.info(f"  Clip epsilon: {training_args.clip_epsilon}")
+    logger.info(f"  Beta (distillation weight): {training_args.beta if teacher_model else 0.0}")
     
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
@@ -333,16 +381,14 @@ def main():
     trainer.save_model(training_args.output_dir)
     logger.info(f"Model saved to {training_args.output_dir}")
 
-    # Save everything else on main process
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
         "dataset": list(data_args.dataset_mixer.keys()) if data_args.dataset_mixer else [],
         "dataset_tags": list(data_args.dataset_mixer.keys()) if data_args.dataset_mixer else [],
-        "tags": ["grpo", "distillm", "alignment-handbook"],
+        "tags": ["grpo", "distillm", "math", "alignment-handbook"],
     }
     if trainer.accelerator.is_main_process:
         trainer.create_model_card(**kwargs)
-        # Restore k,v cache for fast inference
         trainer.model.config.use_cache = True
         trainer.model.config.save_pretrained(training_args.output_dir)
 
@@ -364,5 +410,5 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ["WANDB_DISABLED"] = "true"  # Disable wandb by default
+    os.environ["WANDB_DISABLED"] = "true"
     main()

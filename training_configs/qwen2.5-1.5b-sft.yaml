@@ -1,7 +1,7 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2-1.5B
+model_name_or_path: Qwen/Qwen2.5-Math-1.5B
 torch_dtype: bfloat16
-attn_implementation: flash_attention_2
+attn_implementation: null
 
 chat_template: "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 dataset_mixer:

@@ -175,7 +175,6 @@ def get_datasets(
     )
     return raw_datasets
 
-
 def mix_datasets(
     dataset_mixer: dict,
     splits: Optional[List[str]] = None,
@@ -199,7 +198,8 @@ def mix_datasets(
         shuffle (`bool`, *optional*, defaults to `True`):
             Whether to shuffle the training and testing/validation data.
     """
-    splits = ["train", "test"] if splits is None else splits
+    #splits = ["train", "test"] if splits is None else splits
+    splits = ["train"]
     configs = [None] * len(dataset_mixer) if not configs else configs
     columns_to_keep = [] if columns_to_keep is None else columns_to_keep
 

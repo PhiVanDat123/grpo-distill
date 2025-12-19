@@ -7,10 +7,10 @@
 # Usage: python run_grpo_distillm.py grpo_distillm_config.yaml
 
 # Model Configuration
-model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct  # Student model (to be trained)
-ref_model_name_or_path: Qwen/Qwen2.5-7B-Instruct  # Teacher model (frozen, for distillation)
+model_name_or_path: Qwen/Qwen2.5-Math-1.5B-Instruct  # Student model (to be trained)
+ref_model_name_or_path: Qwen/Qwen2.5-Math-7B-Instruct  # Teacher model (frozen, for distillation)
 torch_dtype: bfloat16
-attn_implementation: flash_attention_2
+attn_implementation: null
 trust_remote_code: true
 
 # PEFT/LoRA Configuration (optional - comment out if not using)
@@ -29,10 +29,9 @@ lora_target_modules:
 
 # Dataset Configuration
 dataset_mixer:
-  HuggingFaceH4/ultrafeedback_binarized: 1.0
+  VoCuc/MetaMathQA-50k-256: 1.0
 dataset_splits:
-  - train_prefs
-  - test_prefs
+  - train
 preprocessing_num_workers: 8
 
 # GRPO Hyperparameters
